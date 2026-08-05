@@ -28,9 +28,12 @@ llvmPackages_18.stdenv.mkDerivation {
   buildInputs = deps.kimeBuildInputs;
   nativeBuildInputs = deps.kimeNativeBuildInputs ++ [ rustToolchain pkgs.cargo rustPlatform.cargoSetupHook ];
   version = kimeVersion;
-  cargoDeps = rustPlatform.fetchCargoVendor {
-    inherit src;
-    hash = "sha256-ZgWHzXixTZWg7+2nXbw2NjeWD/cskGoZ/VSrM7vCwFs=";
+  # importCargoLock rather than fetchCargoVendor: it fetches each crate with
+  # nix's own fetchurl, whereas fetchCargoVendor's helper sends no User-Agent and
+  # crates.io answers those with 403. It also derives every hash from Cargo.lock,
+  # so there is no vendor hash to update whenever a dependency changes.
+  cargoDeps = rustPlatform.importCargoLock {
+    lockFile = ./Cargo.lock;
   };
   LIBCLANG_PATH = "${llvmPackages_18.libclang.lib}/lib";
   dontWrapQtApps = true;
@@ -48,6 +51,14 @@ llvmPackages_18.stdenv.mkDerivation {
   '';
   installPhase = ''
     ninja -C build install
+  '';
+  # fixupPhase shrinks RPATHs to what the ELF actually links against, which
+  # strips every library the candidate window only ever dlopens. Put them back,
+  # or it dies with "The wayland library could not be loaded" before it can draw
+  # anything.
+  postFixup = ''
+    patchelf --add-rpath "${pkgs.lib.makeLibraryPath deps.candidateWindowRuntimeInputs}" \
+      $out/bin/kime-candidate-window
   '';
   doCheck = true;
   checkPhase = ''
