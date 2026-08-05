@@ -1,154 +1,205 @@
+//! Candidate list renderer for kime.
+//!
+//! This process draws candidates and reports mouse clicks. It deliberately does
+//! **not** read the keyboard: the input method owns it. On Wayland an input
+//! method holds an exclusive, seat wide `zwp_input_method_keyboard_grab_v2`, so
+//! key events never reach this window even when it has focus. kime decodes keys
+//! itself and drives this renderer over stdin.
+//!
+//! See `kime_engine_candidate::client` for the wire format.
+
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, Stdout, Write},
-    sync::Arc,
+    sync::{
+        mpsc::{self, Receiver},
+        Arc,
+    },
+    thread,
 };
 
-use egui::Widget;
-
+/// Candidates per page. Must match `kime_engine_backend_hanja::PAGE_SIZE`.
 const PAGE_SIZE: usize = 10;
 
-#[derive(Default)]
-struct KeyState {
-    left: bool,
-    right: bool,
+/// A command from the input method.
+enum Command {
+    Page(usize),
+    Highlight(usize),
+    Quit,
 }
 
 struct CandidateApp {
     stdout: Stdout,
-    key_state: KeyState,
+    commands: Receiver<Command>,
     page_index: usize,
+    highlight: usize,
     max_page_index: usize,
     candidate_list: Vec<(String, String)>,
 }
 
+impl CandidateApp {
+    /// Report the chosen candidate by absolute index. An index rather than the
+    /// text keeps the reply unambiguous; kime resolves it against the same
+    /// dictionary slice it sent us.
+    fn select(&mut self, index: usize, ctx: &egui::Context) {
+        let _ = writeln!(self.stdout, "{index}");
+        let _ = self.stdout.flush();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
 impl eframe::App for CandidateApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_down(egui::Key::Escape)) || ctx.input(|i| i.key_down(egui::Key::Q)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
-        macro_rules! num_hotkey {
-            ($k:expr, $n:expr) => {
-                if ctx.input(|i| i.key_down($k)) {
-                    self.page_index = $n;
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                Command::Page(page) => self.page_index = page.min(self.max_page_index),
+                Command::Highlight(index) => {
+                    self.highlight = index.min(self.candidate_list.len().saturating_sub(1));
+                    self.page_index = (self.highlight / PAGE_SIZE).min(self.max_page_index);
                 }
-            };
-        }
-
-        num_hotkey!(egui::Key::Num1, 0);
-        num_hotkey!(egui::Key::Num2, 1);
-        num_hotkey!(egui::Key::Num3, 2);
-        num_hotkey!(egui::Key::Num4, 3);
-        num_hotkey!(egui::Key::Num5, 4);
-        num_hotkey!(egui::Key::Num6, 5);
-        num_hotkey!(egui::Key::Num7, 6);
-        num_hotkey!(egui::Key::Num8, 7);
-        num_hotkey!(egui::Key::Num9, 8);
-        num_hotkey!(egui::Key::Num0, 9);
-
-        if ctx.input(|i| i.key_down(egui::Key::ArrowLeft))
-            || ctx.input(|i| i.key_down(egui::Key::H))
-        {
-            if !self.key_state.left {
-                self.page_index = self.page_index.saturating_sub(1);
-                self.key_state.left = true;
+                Command::Quit => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
             }
-        }
-
-        if ctx.input(|i| i.key_released(egui::Key::ArrowLeft))
-            || ctx.input(|i| i.key_released(egui::Key::H))
-        {
-            self.key_state.left = false;
-        }
-
-        if ctx.input(|i| i.key_down(egui::Key::ArrowRight))
-            || ctx.input(|i| i.key_down(egui::Key::L))
-        {
-            if !self.key_state.right {
-                self.page_index = self.page_index.saturating_add(1).min(self.max_page_index);
-                self.key_state.right = true;
-            }
-        }
-
-        if ctx.input(|i| i.key_released(egui::Key::ArrowRight))
-            || ctx.input(|i| i.key_released(egui::Key::L))
-        {
-            self.key_state.right = false;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                let from = self.page_index * PAGE_SIZE;
-                let to = (from + PAGE_SIZE).min(self.candidate_list.len());
+            let from = self.page_index * PAGE_SIZE;
+            let to = (from + PAGE_SIZE).min(self.candidate_list.len());
 
-                for (key, value) in self.candidate_list[from..to].iter() {
-                    let quitted = ui
-                        .horizontal(|ui| {
-                            ui.colored_label(egui::Color32::LIGHT_BLUE, key);
-                            ui.separator();
-                            if ui.button(value).clicked() {
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .inner;
+            let mut clicked = None;
 
-                    if quitted {
-                        self.stdout.write_all(key.as_bytes()).unwrap();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        return;
-                    }
+            for (offset, (key, value)) in self.candidate_list[from..to].iter().enumerate() {
+                let index = from + offset;
+                // The digit that picks this row, matching kime's key handling:
+                // 1-9 then 0 for the tenth.
+                let hotkey = (offset + 1) % PAGE_SIZE;
+
+                let selected = index == self.highlight;
+                let label = format!("{hotkey}.  {key}    {value}");
+
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::Button::selectable(selected, label),
+                    )
+                    .clicked()
+                {
+                    clicked = Some(index);
                 }
-            });
+            }
+
+            if let Some(index) = clicked {
+                self.select(index, ctx);
+            }
         });
 
         egui::TopBottomPanel::bottom("candidate-footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for i in 0..self.max_page_index + 1 {
-                    if i == self.page_index {
-                        egui::Button::new(
-                            egui::RichText::new(format!("[{}]", i + 1))
-                                .color(egui::Color32::YELLOW),
-                        )
-                        .ui(ui);
+                for page in 0..=self.max_page_index {
+                    let label = if page == self.page_index {
+                        egui::RichText::new(format!("[{}]", page + 1)).color(egui::Color32::YELLOW)
                     } else {
-                        if ui.button(format!("{}", i + 1)).clicked() {
-                            self.page_index = i;
-                        }
+                        egui::RichText::new(format!("{}", page + 1))
                     };
+
+                    if ui.button(label).clicked() {
+                        self.page_index = page;
+                    }
                 }
             });
         });
     }
 }
 
-fn main() -> io::Result<()> {
-    let mut buf = String::with_capacity(4096);
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-
+/// Read the candidate list, terminated by an `end` line.
+///
+/// The list used to be terminated by EOF, which meant stdin could not stay open
+/// for later commands.
+fn read_candidate_list(stdin: &mut impl BufRead) -> io::Result<Vec<(String, String)>> {
     let mut candidate_list = Vec::new();
-    let mut stdin_lock = stdin.lock();
-
-    macro_rules! read {
-        ($ret:ident) => {
-            let len = stdin_lock.read_line(&mut buf)?;
-            if len == 0 {
-                break;
-            }
-            let $ret = buf.trim_end_matches('\n').to_string();
-            buf.clear();
-        };
-    }
+    let mut buf = String::with_capacity(4096);
 
     loop {
-        read!(key);
-        read!(value);
-        candidate_list.push((key, value));
+        buf.clear();
+
+        if stdin.read_line(&mut buf)? == 0 {
+            break;
+        }
+
+        let line = buf.trim_end_matches(['\n', '\r']);
+
+        if line == "end" {
+            break;
+        }
+
+        match line.split('\t').collect::<Vec<_>>()[..] {
+            ["c", key, value] => candidate_list.push((key.to_string(), value.to_string())),
+            _ => eprintln!("kime-candidate-window: ignoring malformed line {line:?}"),
+        }
     }
+
+    Ok(candidate_list)
+}
+
+/// Forward commands from the input method into the UI thread.
+fn spawn_command_reader(ctx: egui::Context) -> Receiver<Command> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
+
+        while let Some(Ok(line)) = lines.next() {
+            let command = match line.trim().split_once(' ') {
+                Some(("page", arg)) => arg.parse().ok().map(Command::Page),
+                Some(("hl", arg)) => arg.parse().ok().map(Command::Highlight),
+                _ if line.trim() == "quit" => Some(Command::Quit),
+                _ => None,
+            };
+
+            let Some(command) = command else {
+                eprintln!("kime-candidate-window: ignoring unknown command {line:?}");
+                continue;
+            };
+
+            let quit = matches!(command, Command::Quit);
+
+            if tx.send(command).is_err() {
+                break;
+            }
+
+            ctx.request_repaint();
+
+            if quit {
+                return;
+            }
+        }
+
+        // stdin closed: the input method is gone, so this window is orphaned.
+        let _ = tx.send(Command::Quit);
+        ctx.request_repaint();
+    });
+
+    rx
+}
+
+fn main() -> io::Result<()> {
+    let stdout = io::stdout();
+
+    let candidate_list = {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        read_candidate_list(&mut stdin)?
+    };
+
+    if candidate_list.is_empty() {
+        eprintln!("kime-candidate-window: empty candidate list");
+        return Ok(());
+    }
+
+    let max_page_index = (candidate_list.len().div_ceil(PAGE_SIZE)) - 1;
 
     eframe::run_native(
         "kime-candidate",
@@ -159,7 +210,7 @@ fn main() -> io::Result<()> {
                 .with_window_level(egui::WindowLevel::AlwaysOnTop),
             ..Default::default()
         },
-        Box::new(|cc| {
+        Box::new(move |cc| {
             let config = kime_engine_core::load_engine_config_from_config_dir().unwrap_or_default();
             let (font_bytes, _index) = config.candidate_font;
             let mut font_data = BTreeMap::<_, Arc<egui::FontData>>::new();
@@ -178,20 +229,19 @@ fn main() -> io::Result<()> {
                 families,
             });
 
+            let commands = spawn_command_reader(cc.egui_ctx.clone());
+
             Ok(Box::new(CandidateApp {
                 stdout,
+                commands,
                 page_index: 0,
-                key_state: KeyState::default(),
-                max_page_index: if candidate_list.len() % PAGE_SIZE == 0 {
-                    (candidate_list.len() / PAGE_SIZE) - 1
-                } else {
-                    candidate_list.len() / PAGE_SIZE
-                },
+                highlight: 0,
+                max_page_index,
                 candidate_list,
             }))
         }),
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(())
 }

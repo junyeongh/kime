@@ -228,6 +228,16 @@ impl InputEngine {
         self.current_result()
     }
 
+    /// fd that becomes readable when a pending mode finishes out of band, such
+    /// as the hanja candidate window reporting a mouse click.
+    ///
+    /// Frontends with an event loop should register this rather than waiting for
+    /// a focus change, which is not a reliable signal on Wayland.
+    #[inline]
+    pub fn ready_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.engine_impl.ready_fd()
+    }
+
     fn current_result(&mut self) -> InputResult {
         let mut ret = InputResult::empty();
         if self.engine_impl.has_preedit() {
@@ -390,6 +400,14 @@ impl EngineImpl {
 
     pub fn end_ready(&mut self, commit_buf: &mut String) {
         do_mode!(@ret self, end_ready(commit_buf,));
+    }
+
+    pub fn ready_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        match self.mode {
+            #[cfg(feature = "hanja")]
+            Some(InputMode::Hanja) => self.hanja_mode.ready_fd(),
+            _ => None,
+        }
     }
 }
 

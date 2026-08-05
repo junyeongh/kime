@@ -1811,6 +1811,7 @@ dependencies = [
  "kime-engine-backend",
  "kime-engine-candidate",
  "kime-engine-dict",
+ "log",
 ]
 
 [[package]]
