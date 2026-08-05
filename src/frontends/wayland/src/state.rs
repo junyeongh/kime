@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use kime_engine_core::{
@@ -45,6 +45,13 @@ use xkbcommon::xkb::{
 
 const ZWP_TEXT_INPUT_V1_PREEDIT_STYLE_UNDERLINE: u32 = 5;
 
+const POLL_WAYLAND: Token = Token(0);
+const POLL_TIMER: Token = Token(1);
+/// The hanja candidate window's reply pipe. Without this the only thing that can
+/// notice a mouse selection is a focus change, which no part of the input method
+/// protocol promises to deliver.
+const POLL_CANDIDATE: Token = Token(2);
+
 /// Registry state for binding globals
 struct Globals {
     seat: Option<WlSeat>,
@@ -87,6 +94,9 @@ pub struct AppState {
     repeat_state: Option<(RepeatInfo, PressState)>,
     last_preedit_len: usize,
     should_exit: bool,
+    /// The engine's candidate pipe we are watching, paired with our own `dup` of
+    /// it that is actually registered with the poller.
+    candidate: Option<(RawFd, OwnedFd)>,
 
     // Wayland state
     globals: Globals,
@@ -105,6 +115,7 @@ impl AppState {
             mod_state: ModifierState::empty(),
             numlock: false,
             engine_ready: true,
+            candidate: None,
             serial: 0,
             timer,
             // For v1, provide default repeat info since older protocols might not provide it
@@ -199,7 +210,6 @@ impl AppState {
         let mut poll = Poll::new().expect("Initialize epoll()");
         let registry = poll.registry();
 
-        const POLL_WAYLAND: Token = Token(0);
         registry
             .register(
                 &mut SourceFd(&conn.as_fd().as_raw_fd()),
@@ -208,7 +218,6 @@ impl AppState {
             )
             .expect("Register wayland socket to the epoll()");
 
-        const POLL_TIMER: Token = Token(1);
         registry
             .register(&mut self.timer, POLL_TIMER, Interest::READABLE)
             .expect("Register timer to the epoll()");
@@ -274,9 +283,87 @@ impl AppState {
                             return;
                         }
                     }
-                    _ => unreachable!(),
+                    POLL_CANDIDATE => self.handle_candidate_ev(poll.registry()),
+                    token => log::warn!("Unexpected poll token: {:?}", token),
                 }
             }
+
+            self.sync_candidate_registration(poll.registry());
+        }
+    }
+
+    /// Keep the poller watching the candidate window for exactly as long as the
+    /// engine is waiting on it.
+    ///
+    /// We watch our own `dup` of the engine's pipe rather than the engine's fd.
+    /// The engine closes its copy as soon as the session ends, which would leave
+    /// us deregistering a dead fd -- and a recycled fd number could see us watch,
+    /// or cancel, something else entirely.
+    fn sync_candidate_registration(&mut self, registry: &mio::Registry) {
+        let wanted = if self.engine_ready {
+            None
+        } else {
+            self.engine.ready_fd()
+        };
+
+        if wanted == self.candidate.as_ref().map(|(source, _)| *source) {
+            return;
+        }
+
+        self.deregister_candidate(registry);
+
+        let Some(source) = wanted else {
+            return;
+        };
+
+        // SAFETY: `source` is the engine's live pipe; it stays open until the
+        // engine ends the session, which cannot happen before this returns.
+        let owned = unsafe {
+            let fd = libc::dup(source);
+            if fd < 0 {
+                log::error!(
+                    "Failed to dup candidate window fd: {}",
+                    std::io::Error::last_os_error()
+                );
+                return;
+            }
+            OwnedFd::from_raw_fd(fd)
+        };
+
+        match registry.register(
+            &mut SourceFd(&owned.as_raw_fd()),
+            POLL_CANDIDATE,
+            Interest::READABLE,
+        ) {
+            Ok(()) => self.candidate = Some((source, owned)),
+            Err(e) => log::error!("Failed to register candidate window: {}", e),
+        }
+    }
+
+    fn deregister_candidate(&mut self, registry: &mio::Registry) {
+        if let Some((_, owned)) = self.candidate.take() {
+            if let Err(e) = registry.deregister(&mut SourceFd(&owned.as_raw_fd())) {
+                log::warn!("Failed to deregister candidate window: {}", e);
+            }
+        }
+    }
+
+    /// The candidate window answered, so collect the result without waiting for
+    /// a focus change.
+    fn handle_candidate_ev(&mut self, registry: &mio::Registry) {
+        // Stop watching before the engine drops its end of the pipe.
+        self.deregister_candidate(registry);
+
+        if self.engine_ready || !self.engine.check_ready() {
+            return;
+        }
+
+        let ret = self.engine.end_ready();
+
+        if self.im_v2.is_some() {
+            self.process_input_result_v2(ret);
+        } else {
+            self.process_input_result_v1(ret);
         }
     }
 
@@ -354,9 +441,10 @@ impl AppState {
     }
 
     fn process_input_result_v2(&mut self, ret: InputResult) -> bool {
-        if ret.contains(InputResult::NOT_READY) {
-            self.engine_ready = false;
-        }
+        // Track readiness in both directions, as the XIM frontend does. Only
+        // ever clearing this left it stuck false after an aborted candidate
+        // session, which in turn made every later Deactivate skip its reset.
+        self.engine_ready = !ret.contains(InputResult::NOT_READY);
 
         if ret.contains(InputResult::LANGUAGE_CHANGED) {
             self.engine.update_layout_state().ok();
@@ -390,9 +478,7 @@ impl AppState {
     }
 
     fn process_input_result_v1(&mut self, ret: InputResult) -> bool {
-        if ret.contains(InputResult::NOT_READY) {
-            self.engine_ready = false;
-        }
+        self.engine_ready = !ret.contains(InputResult::NOT_READY);
 
         if ret.contains(InputResult::LANGUAGE_CHANGED) {
             self.engine.update_layout_state().ok();
@@ -573,10 +659,13 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppState {
 
                 if should_activate {
                     state.engine.update_layout_state().ok();
+                    // Belt and braces: POLL_CANDIDATE normally gets here first,
+                    // but keep honouring a focus edge for compositors that
+                    // deliver one. `process_input_result_v2` updates
+                    // `engine_ready`.
                     if !state.engine_ready && state.engine.check_ready() {
                         let ret = state.engine.end_ready();
                         state.process_input_result_v2(ret);
-                        state.engine_ready = true;
                     }
                     if let Some(ref mut im_state) = state.im_v2 {
                         im_state.grab_activate = true;
@@ -758,7 +847,6 @@ impl Dispatch<ZwpInputMethodV1, ()> for AppState {
                 if !state.engine_ready && state.engine.check_ready() {
                     let ret = state.engine.end_ready();
                     state.process_input_result_v1(ret);
-                    state.engine_ready = true;
                 }
 
                 // Grab keyboard
