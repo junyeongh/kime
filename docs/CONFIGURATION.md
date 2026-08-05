@@ -90,6 +90,30 @@ Hotkey for specific category override global hotkey
 
 Hotkey for specific mode override global, category hotkey
 
+### Hanja mode
+
+Pressing the hanja hotkey (`F9`, `HangulHanja` or `ControlR` by default) while a
+syllable is being composed opens the candidate window. Note this only works while
+the syllable is still in the preedit; once it has been committed there is nothing
+to convert.
+
+Hanja mode requires the `kime-candidate-window` binary to be on `PATH`. If it is
+missing the hanja hotkey does nothing at all; kime logs an error saying so.
+
+While the candidate window is open, the input method handles the keys itself:
+
+| Key | Action |
+| --- | --- |
+| `1`-`9`, `0` | Commit the corresponding candidate on the current page |
+| `Left` / `Right`, `H` / `L`, `PageUp` / `PageDown` | Previous / next page |
+| `Up` / `Down`, `K` / `J` | Move the highlight |
+| `Home` / `End` | First / last candidate |
+| `Enter`, `Tab` | Commit the highlighted candidate (see `mode_hotkeys`) |
+| `Esc` | Cancel |
+| Anything else | Cancel and pass the key through to the application |
+
+Candidates can also be clicked with the mouse.
+
 ### content
 
 #### behavior

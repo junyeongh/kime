@@ -4,7 +4,34 @@
 
 ### Breaking
 
+* The `kime-candidate-window` protocol is now a bidirectional line protocol and stdin
+  stays open for the session. A `kime-candidate-window` from an older release is not
+  compatible with this engine, and vice versa.
+
 ### Improve
+
+* feat(hanja): select candidates with the keyboard. `1`-`9`/`0` pick a candidate on the
+  current page, `Left`/`Right` (or `H`/`L`, `PageUp`/`PageDown`) page, `Up`/`Down` (or
+  `K`/`J`) move the cursor, `Home`/`End` jump, `Enter`/`Tab` commit the highlighted
+  candidate and `Esc` cancels. Previously the digit keys only switched *page* and there
+  was no way at all to commit a candidate without clicking it with the mouse.
+* fix(hanja): key handling moved into the engine, so the candidate window no longer needs
+  keyboard focus. On Wayland an input method holds an exclusive, seat wide
+  `zwp_input_method_keyboard_grab_v2`, so key events never reached the candidate window in
+  the first place.
+* fix(hanja): pressing any key while the candidate window was open used to reset the mode
+  and kill the window, discarding a selection it had already received.
+* fix(hanja): `Enter`/`Tab` in hanja mode were consumed but did nothing.
+* fix(hanja): a candidate window that failed to start or crashed was reported as a
+  successful empty selection. The child's exit status is now checked, and a failure to
+  spawn it is logged instead of silently swallowing the hanja key.
+* fix(wayland): register the candidate window's pipe with the event loop, so a mouse
+  selection is picked up immediately instead of waiting for a focus change that the input
+  method protocol never promised to deliver.
+* fix(wayland): track engine readiness in both directions like the XIM frontend does. It
+  was only ever cleared, so it stayed stuck after an aborted candidate session and made
+  every later `Deactivate` skip its reset.
+* feat(hanja): show the highlighted candidate in the preedit string.
 
 ## 3.2.0
 
